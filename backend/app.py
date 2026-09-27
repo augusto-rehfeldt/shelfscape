@@ -16,7 +16,10 @@ for _line in (_env.read_text(encoding="utf-8").splitlines() if _env.exists() els
     if _sep and _key.strip() and not _key.startswith("#"):
         os.environ.setdefault(_key.strip(), _value)
 from flask import Flask, jsonify, request, send_from_directory, send_file
-from embeddings import EmbeddingsManager, build_cache_stem
+if __package__:
+    from .embeddings import EmbeddingsManager, build_cache_stem
+else:
+    from embeddings import EmbeddingsManager, build_cache_stem
 
 
 # Suppress verbose Werkzeug request logs for health checks
@@ -44,11 +47,6 @@ app = Flask(__name__, static_folder=frontend_path, static_url_path="")
 
 # Initialize embeddings manager
 stories_path = os.path.join(os.path.dirname(__file__), "..", "stories")
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Explore a local text collection')
-    parser.add_argument('--stories', default=stories_path, help='Folder containing TXT/CSV inputs')
-    stories_path = os.path.abspath(os.path.expanduser(parser.parse_args().stories))
 covers_path = os.path.join(stories_path, "covers")
 backend_path = os.path.dirname(__file__)
 encoding_mode = os.getenv("EMBEDDING_ENCODING_MODE", "auto")
@@ -104,19 +102,26 @@ _load_thread = None
 _load_thread_lock = threading.Lock()
 
 
+def _load_stories():
+    try:
+        embeddings_manager.load_stories()
+    except Exception:
+        pass  # The manager records the actionable error for /api/health.
+
+
 def ensure_story_loading_started():
     global _load_thread
-    if embeddings_manager.is_loading or embeddings_manager.is_ready:
+    if embeddings_manager.is_loading or embeddings_manager.is_ready or embeddings_manager.load_error:
         return
 
     with _load_thread_lock:
         if _load_thread is not None and _load_thread.is_alive():
             return
-        if embeddings_manager.is_loading or embeddings_manager.is_ready:
+        if embeddings_manager.is_loading or embeddings_manager.is_ready or embeddings_manager.load_error:
             return
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}][BOOT] Starting story loading on demand...")
-        _load_thread = threading.Thread(target=embeddings_manager.load_stories, daemon=True)
+        _load_thread = threading.Thread(target=_load_stories, daemon=True)
         _load_thread.start()
 
 
@@ -252,17 +257,29 @@ def health():
     )
 
 
+def run_server(open_browser=True):
+    import webbrowser
+    from werkzeug.serving import make_server
+    # Bind first; port zero lets the OS select a free port if 5000 is occupied.
+    try:
+        server = make_server("127.0.0.1", 5000, app, threaded=True)
+    except SystemExit:
+        server = make_server("127.0.0.1", 0, app, threaded=True)
+    url = f"http://127.0.0.1:{server.server_port}"
+    print(f"Shelfscape: {url}")
+    ensure_story_loading_started()
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 if __name__ == "__main__":
-    import socket
-
-    port = 5000
-    while port < 5100:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("localhost", port)) != 0:
-                break
-        print(f"[{datetime.now().strftime('%H:%M:%S')}][BOOT] Port {port} in use, trying {port + 1}...")
-        port += 1
-
-    print(f"[{datetime.now().strftime('%H:%M:%S')}][BOOT] Starting server on port {port}")
-    ensure_story_loading_started()  # index while the browser opens, not on its first request
-    app.run(port=port, threaded=True)
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from main import main
+    main()

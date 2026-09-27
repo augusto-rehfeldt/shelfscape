@@ -27,7 +27,8 @@ class SharedSuiteTests(unittest.TestCase):
         service.embed = lambda texts, model=None: (service.calls.append((list(texts), model)),
                                                    [[float(len(t)), 1.0] for t in texts])[1]
         with tempfile.TemporaryDirectory() as folder, \
-                patch.object(module, "shared_embedding_service", return_value=service) as factory:
+                patch.object(module, "shared_embedding_service", return_value=service) as factory, \
+                patch.object(module.EmbeddingsManager, "_ensure_lm_studio"):
             manager = self.manager(folder)
             manager.load_model()
             vectors = manager._encode_texts(["a\nb", "cc", "ddd"])
@@ -86,7 +87,9 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             before = manager.dataset_fingerprint
             self.assertEqual(manager.story_keys, ['library-1', 'library-2'])
-            load(rows)
+            with patch.object(module.EmbeddingsManager, 'load_model') as model:
+                load(rows)
+                model.assert_not_called()
             self.assertEqual(len(calls), 2)
             rows[0]['summary'] = 'Changed'
             manager = load(rows)
@@ -125,6 +128,10 @@ class CacheTests(unittest.TestCase):
         sims = np.array([0.95, 0.91, 0.55, 0.05, -0.3])
         radii = np.hypot(*module.radial_layout(sims).T)
         np.testing.assert_allclose(radii, [0.08, 0.08 + 0.03 * np.sin(2.5), 0.48, 0.96, 0.96 + 0.03 * np.sin(2.5)])
+
+
+# Keep startup regressions in the workspace's existing test_cache entry point.
+from test_startup import StartupTests
 
 
 if __name__ == '__main__':

@@ -32,7 +32,7 @@ shelfscape/
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - Packages from `requirements.txt`
 - Optional: a GPU for faster local encoding
 - Optional: `umap-learn` for better 2D projections; the app falls back to PCA if it is unavailable
@@ -63,17 +63,20 @@ You can also generate sample data:
 python generate_stories.py
 ```
 
-Then start the backend:
+Start everything with one command:
 
-```bash
-python backend/app.py
+```powershell
+python main.py
 ```
 
-Open the app in your browser at:
+The browser opens after the local server binds. Do not open `frontend/index.html`
+as a file. `--no-open` keeps the browser closed.
 
-```text
-http://localhost:5000
-```
+If `~/Calibre Library/metadata.db` exists, startup refreshes a read-only snapshot
+through the sibling `book-watch` checkout. Set `CALIBRE_LIBRARY` in `.env` or use
+`--library "path/to/library"` for another library. `--stories path/to/collection`
+selects TXT/CSV input instead. Without a detected library, `stories/` is used.
+Library errors stop startup rather than silently using a stale snapshot.
 
 ## Text formats
 
@@ -134,7 +137,7 @@ export EMBEDDING_PROVIDER=lm_studio
 export EMBEDDING_MODEL=text-embedding-qwen3-embedding-0.6b
 export LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
 export LM_STUDIO_API_KEY=lm-studio
-python backend/app.py
+python main.py
 ```
 
 Useful tuning variables:
@@ -161,22 +164,23 @@ The backend currently exposes:
 
 ## Caches
 
-The backend writes embedding (`.npz`) and projection (`.json`) caches under `backend/`.
+Collection-specific embedding (`.npz`) and projection (`.json`) caches live under
+ignored `data/cache/`. The original `stories/` collection retains its `backend/` caches.
 An older JSON embedding cache is converted on first start.
 They are keyed by provider/model so different embedding setups do not overwrite each other.
 If you change your dataset and want a clean rebuild, delete the cache files and restart the server.
 
 ## Notes
 
-- The app loads stories from `stories/` relative to the repo root.
+- Startup chooses Calibre when available; `--stories stories` forces the original collection.
 - Cover images can live in `stories/covers/` or be referenced by path in story metadata.
 - `examples/` contains sample text files you can copy into your own dataset.
-- If the configured port is busy, the backend automatically tries the next port up to 5099.
+- If port 5000 is busy, the OS selects an available port; the browser opens that address.
 
 ## Calibre/book-watch integration
 
 From book-watch, run `python book_watch.py export-atlas --output data/atlas/library.csv`.
-Then, from this project, run `python backend/app.py --stories ../book-watch/data/atlas`.
+Then, from this project, run `python main.py --stories ../book-watch/data/atlas`.
 This selects the exported library without mixing it into the original stories folder.
 The summarizer plugin's custom column feeds the export; book comments are a fallback.
 
@@ -184,8 +188,56 @@ CSV may include `id` and `calibre_id`. Explicit IDs survive sorting and re-expor
 duplicate IDs are rejected. Files without explicit IDs retain their legacy row IDs.
 Embedding caches use the actual per-record embedding text, provider and model, so an
 edited CSV row does not re-encode every other row. Projection caches fingerprint the
-ordered dataset; replacing/editing stories rebuilds positions automatically. Legacy
-caches are rebuilt once. Restart the backend after updating a collection.
+ordered dataset; replacing/editing stories rebuilds positions automatically. Compatible legacy CSV cache entries are migrated; changed embedding inputs rebuild automatically. Restart the backend after updating a collection.
 
 Offline cache checks (tiny synthetic encoder, no downloads):
-`python -B -m unittest -q test_cache`.
+`python -B -m unittest -q test_cache test_startup`.
+
+## Automatic Calibre refresh
+
+`python main.py` refreshes the snapshot on every launch. It indexes new books and
+changed summaries; unchanged embedding inputs reuse their vectors. Deleted books
+leave the current index. Calibre's database and books are never modified. Snapshots
+are separate from `stories/`, with stable UUID-based IDs.
+
+Retrieval uses the complete `#summary`, or comments when no summary exists, plus
+metadata and tags. It does **not** read entire EPUB/PDF files or generate missing
+summaries. Startup reports how many books have summaries. Use the existing Calibre
+summarizer to improve missing or weak descriptions.
+
+LM Studio starts through `lms server start` when a local embedding endpoint is down.
+Remote endpoints never launch a local server. Fully cached browsing does not need
+LM Studio; searching or indexing new content does. A failed startup is reported by
+`/api/health` without retrying indefinitely on every poll; restart after fixing it.
+
+## Local model review (2026-09-27)
+
+Keep the installed Qwen3-Embedding-0.6B for now: no new model download was requested
+after reviewing the approximately 4.9 GB upgrade. A stronger model needs a separate
+index; vectors from different models must not be mixed.
+
+- **[Nemotron-3-Embed-8B](https://huggingface.co/nvidia/Nemotron-3-Embed-8B-BF16)**:
+  leading upgrade candidate. July 2026 model card reports RTEB-16 78.46 and MMTEB
+  retrieval 75.45. OpenMDW 1.1 license. Community GGUFs exist, but their LM Studio
+  pooling/runtime compatibility and quantized retrieval quality remain unverified.
+  Shelfscape supports its documented `query: ` / `passage: ` input prefixes.
+- **[Nemotron-3-Embed-1B](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16)**:
+  lower-memory candidate, reported RTEB-16 72.38. Also requires runtime validation.
+- **[Octen-Embedding-8B](https://huggingface.co/Octen/Octen-Embedding-8B)**:
+  Apache-2.0 Qwen3 derivative, strong January 2026 RTEB results; 4B variant available.
+  Its overall RTEB score is not directly comparable to NVIDIA's RTEB-16 subset.
+- **[Qwen3-Embedding-8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B)**:
+  established Apache-2.0 upgrade; 4B offers a memory/speed compromise. Both support
+  long-context text and instruction-aware queries.
+- **[Jina Embeddings v4](https://huggingface.co/jinaai/jina-embeddings-v4)**:
+  visual-document and multi-vector features add little to this summary-only index.
+- **[EmbeddingGemma](https://huggingface.co/google/embeddinggemma-300m)**:
+  lightweight candidate, not a demonstrated quality upgrade for this library.
+
+These are published model-card claims, not an exhaustive independently verified
+leaderboard or a library-specific benchmark. Bigger models cannot recover topics
+missing from summaries. Test representative complex queries before switching.
+
+After installing and validating a model in LM Studio, pass its exact identifier:
+`python main.py --model MODEL_IDENTIFIER`. This does not download models or silently
+fall back to another model. All embedding API calls still go through ai-suite.

@@ -196,6 +196,7 @@ class EmbeddingsManager:
     def load_model(self):
         if self.model is None:
             if self.embedding_provider == "lm_studio":
+                self._ensure_lm_studio()
                 self._emit_status(
                     f"Connecting to LM Studio embeddings at {self.lm_studio_base_url} "
                     f"using model {self.model_name}..."
@@ -212,6 +213,27 @@ class EmbeddingsManager:
                 self.model = sentence_transformer_cls(self.model_name)
                 self._emit_status("Embedding model loaded successfully!")
         return self.model
+
+    def _ensure_lm_studio(self):
+        """Start the LM Studio server through its `lms` CLI when nothing listens on the port.
+        The embedding model loads on first request (LM Studio just-in-time loading)."""
+        import shutil
+        import socket
+        import subprocess
+        from urllib.parse import urlparse
+        url = urlparse(self.lm_studio_base_url)
+        port = url.port or (443 if url.scheme == "https" else 80)
+        try:
+            with socket.create_connection((url.hostname or "127.0.0.1", port), timeout=2):
+                return
+        except OSError:
+            if url.hostname not in ("localhost", "127.0.0.1", "::1"):
+                raise RuntimeError(f"Embedding server unavailable: {self.lm_studio_base_url}")
+        lms = shutil.which("lms") or os.path.expanduser("~/.cache/lm-studio/bin/lms.exe")
+        if not os.path.exists(lms) and not shutil.which("lms"):
+            raise RuntimeError(f"LM Studio is not running at {self.lm_studio_base_url}; open it and start the server")
+        self._emit_status("LM Studio server is not running, starting it...")
+        subprocess.run([lms, "server", "start", "--port", str(port)], check=True, timeout=120)
 
     def _get_file_hash(self, filepath: str) -> str:
         with open(filepath, "rb") as f:
@@ -297,6 +319,14 @@ class EmbeddingsManager:
         return max(self.min_batch_size, min(self.max_batch_size, estimated or self.min_batch_size))
 
     def _build_embedding_text(self, record: Dict) -> str:
+        text = self._build_book_text(record)
+        if record.get("tags"):
+            text += ". Topics: " + record["tags"]
+        if "nemotron-3-embed" in self.model_name.lower():
+            text = "passage: " + text
+        return text
+
+    def _build_book_text(self, record: Dict) -> str:
         """Build the text used for embedding from available metadata."""
         if record["summary"]:
             parts = [record["title"]]
@@ -440,18 +470,18 @@ class EmbeddingsManager:
 
     def _encode_query(self, query: str) -> np.ndarray:
         """Encode a search query using a retrieval-style instruction prompt."""
+        self.load_model()
         query_text = (
             f"Instruct: {self.query_instruction}\n"
             f"Query: {query}"
         )
+        if "nemotron-3-embed" in self.model_name.lower():
+            query_text = "query: " + query
         if self.embedding_provider == "lm_studio":
             vector = self.model.embed([query_text.replace("\n", " ")], model=self.model_name)[0]
             return np.array(vector, dtype=np.float32)
 
-        try:
-            return self.model.encode(query_text, prompt_name="query")
-        except (TypeError, ValueError):
-            return self.model.encode(query_text)
+        return self.model.encode(query_text, prompt="")
 
     def _cover_url_for_story(self, story_id: str) -> str:
         story = self.stories.get(story_id, {})
@@ -620,6 +650,7 @@ class EmbeddingsManager:
 
     def _iter_csv_story_records(self, filename: str, filepath: str):
         self._emit_status(f"Reading CSV file: {filename}")
+        file_hash = self._get_file_hash(filepath)
         with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
             base_name = os.path.splitext(filename)[0]
@@ -661,6 +692,7 @@ class EmbeddingsManager:
                     "source_filename": filename,
                     "story_id": normalized.get('id') or f"{base_name}_{row_index:04d}",
                     "calibre_id": normalized.get('calibre_id', ''),
+                    "legacy_cache_key": f"{filename}_{file_hash}_row_{row_index}",
                     "title": title,
                     "author": author,
                     "summary": normalized.get("summary", ""),
@@ -687,7 +719,6 @@ class EmbeddingsManager:
             self.projections_2d = None
 
             self._emit_status("Starting to load stories...")
-            self.load_model()
             self._emit_status("Scanning stories folder for .txt and .csv files...")
             cache = self._load_cache()
 
@@ -698,6 +729,7 @@ class EmbeddingsManager:
             self._emit_status(f"Found {len(story_records)} story entries")
 
             if self.benchmark_encoding:
+                self.load_model()
                 benchmark_texts = [
                     self._build_embedding_text(record)
                     for record in story_records[: self.benchmark_sample_size]
@@ -714,6 +746,8 @@ class EmbeddingsManager:
                     self.embedding_provider, self.model_name, self._build_embedding_text(record)
                 ], ensure_ascii=False).encode('utf-8')).hexdigest()
                 embedding = cache.get(cache_key)
+                if embedding is None and self._build_embedding_text(record) == self._build_book_text(record):
+                    embedding = cache.get(record.get("legacy_cache_key"))
                 cached_embeddings_count += embedding is not None
                 story_entries.append(
                     {"record": record, "cache_key": cache_key, "embedding": embedding}
@@ -722,6 +756,7 @@ class EmbeddingsManager:
             uncached_entries = [entry for entry in story_entries if entry["embedding"] is None]
 
             if uncached_entries:
+                self.load_model()
                 embeddings = self._encode_texts(
                     [self._build_embedding_text(entry["record"]) for entry in uncached_entries]
                 )

@@ -35,3 +35,6 @@ Thumbs.db
 # Data - keep the folder structure but not generated stories
 # Uncomment the next line if you don't want to track your custom texts
 # stories/*.txt
+
+# Read-only Calibre snapshots and collection-specific caches
+data/
